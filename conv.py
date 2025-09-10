@@ -1,121 +1,138 @@
-import torch 
+# Copyright 2025 The savitri-AI Team. All rights reserved.
+#
+#    company: https://github.com/savitri-AI
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import torch
 from torch import nn 
-from typing import Union
-from timm.layers import trunc_normal_
+from typing import Union, Tuple
+from torch.nn import functional as F
 from einops import rearrange
+
 
 class CausalConv3d(nn.Module):
 
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size: Union[int, tuple[int, int, int]] = 3,
-                 stride: Union[int, tuple[int, int, int]] = 1,
-                 padding = 0,
-                 pad_mode = 'constant',
-                 **kwargs
-                 ):
-        
+    """
+        in_channels (`int`): input channels of conv3d
+        out_channels (`int`): output_channels of conv3d
+        kernel_size (`int, Tuple(int, int, int)`): kernel size of conv3d 
+        stride (`int, Tuple(int, int, int)`): stride of conv3d
+        padding (`int, Tuple(int, int, int)`): padding of conv3d
+        **kwargs: key words argument like (`dilation`, `groups`, `bias`, `padding_mode`)
+    """
+
+    def __init__(self, 
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: Union[int, Tuple[int, int, int]] = 3,
+                 stride: Union[int, Tuple[int, int, int]] = 1,
+                 padding: Union[int, Tuple[int, int, int]] = 0,
+                 **kwargs):
         super().__init__()
+
+        self.kernel_size = kernel_size
+        self.kernel_size = (self.kernel_size,)*3 if isinstance(kernel_size, int) else self.kernel_size
+        self.stride = stride
+        self.stride = (self.stride)*3 if isinstance(self.stride, int) else self.stride
         self.padding = padding
-        self.dilation = kwargs.pop('dilation', 1)
-        self.pad_mode = pad_mode
+        self.padding = (self.padding)*3 if isinstance(self.padding, int) else self.padding
+        self.padding_mode = 'constant'
 
-        kernel_size = (kernel_size,) * 3 if isinstance(kernel_size, int) else kernel_size
-        stride = (stride,)*3 if isinstance(stride, int) else stride
-        self.time_kernel_size, self.height_kernel_size, self.width_kernel_size = kernel_size
-
-
-        # padding of conv 
-        self.time_pad = self.dilation * (self.time_kernel_size - 1) # 1 * (3 - 1) => 2
-        self.height_pad = self.height_kernel_size // 2  # ≈ 1 
-        self.width_pad = self.width_kernel_size // 2    # ≈ 1
-
+        self.time_kernel_size, self.height_kernel_size, self.width_kernel_size = self.kernel_size
+        self.dilation = 1
+        
+        # padding 
+        """
+            the calcultion of time_padding is realted to paper: https://arxiv.org/abs/1511.07122
+            we had understanding this padding in notebook section (question-7,8,9): https://github.com/ProgramerSalar/encoder_from_scratch/blob/main/Notebook/notebook.ipynb
+        """
+        self.time_padding = self.dilation * (self.time_kernel_size - 1)  # 1*(3-1)=>2
+        self.height_padding = self.height_kernel_size // 2      # ≈1
+        self.width_padding = self.width_kernel_size // 2        # ≈1
         # (1, 1, 1, 1, 2, 0)
-        self.time_causal_padding = (self.width_pad, self.width_pad, self.height_pad, self.height_pad, self.time_pad, 0)
+        self.causal_time_padding = (self.width_padding, self.width_padding, self.height_padding, self.height_padding, self.time_padding, 0)
 
-        # print(f"in the conv class: kernel_size: {kernel_size}, stride: {stride}, padding: {padding}, dilation: {self.dilation}")
-        self.conv = nn.Conv3d(in_channels=in_channels,
+        self.conv = nn.Conv3d(in_channels=in_channels,      
                               out_channels=out_channels,
-                              kernel_size=kernel_size,
-                              stride=stride,
-                              padding=padding,
-                              dilation=self.dilation,
+                              kernel_size=kernel_size,      # default=3
+                              stride=stride,                # default=1
+                              padding=self.padding,         # default=0
+                              dilation=self.dilation,       # default=0
                               **kwargs)
         
     
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Linear, nn.Conv2d, nn.Conv3d)):
-            trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-
-        elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
 
 
+    def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
 
+        """ 
+            x (`floatTensor`): video input tensor 
+
+            calculate the width, height and frame padding
+                padding (1, 1, 1, 1, 2, 0) -> (width, height, frame) 
+                (8) + (2, 0) => 10
+                256, 256) + (1, 1, 1, 1) => (258, 258)
+                ([1, 2, 8, 256, 256])  ->  ([2, 3, 10, 258, 258])
+                for more info: https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv3d.html
+        """
+                
+        # [2, 3, 8, 256, 256] -> [2, 3, 10, 258, 258]
+        x = F.pad(input=x,
+                  pad=self.causal_time_padding,
+                  mode=self.padding_mode)
+              
+        # [2, 3, 10, 258, 258] -> [2, 128, 8, 256, 256]
+        x = self.conv(x)
+        return x
+    
+
+class CausalGroupNorm(nn.Module):
+
+    def __init__(self,
+                 in_channels:int,
+                 num_groups:int = 32, 
+                 eps: float= 1e-5):
+        
+        """ 
+            This is custom normalization.
+            
+            in_channels (`int`): number of channels expected in input
+            num_groups (`int`): number of groups to separate the channels into 
+            eps (`float`): a value added to the denominator for numerical stability. Default: 1e-5
+        """
+        super().__init__()
+
+        self.group_norm = nn.GroupNorm(num_groups=num_groups,
+                                       num_channels=in_channels,
+                                       eps=eps)
 
     def forward(self, 
-                x: torch.FloatTensor,
-                is_init_image: bool = True,
-                temporal_chunk: bool = False):
+                x: torch.FloatTensor) -> torch.FloatTensor:
         
-        pad_mode = self.pad_mode if self.time_pad < x.shape[2] else 'constant'
 
-        if is_init_image:
-            if not temporal_chunk:
-                # padding (1, 1, 1, 1, 2, 0) -> (height, width, frame) 
-                # (8) + (2, 0) => 10
-                # (256, 256) + (1, 1, 1, 1) => (258, 258)
-                # ([1, 2, 8, 256, 256])  ->  ([2, 3, 10, 258, 258])
-                x = nn.functional.pad(input=x,
-                                    pad=self.time_causal_padding,
-                                    mode=pad_mode)
-                
-            else:
-                print(f'work in progress... `{temporal_chunk}`')
+        b, c, t, h, w = x.shape
+        # x = x.view(b*t, c, h, w)
+        x = rearrange(x, 
+                      'b c t h w -> (b t) c h w', t=t)
+        x = self.group_norm(x)
 
-        
-        x = self.conv(x)
-        return x 
-    
+        # x = x.view(b, c, t, h, w)
+        x = rearrange(x,
+                      '(b t) c h w -> b c t h w', t=t)
 
-
-class CausalGroupNorm(nn.GroupNorm):
-
-    def forward(self,
-                x: torch.Tensor) -> torch.Tensor:
-    
-        t = x.shape[2]
-        x = rearrange(tensor=x,
-                      pattern='b c t h w -> (b t) c h w')
-        
-        # pass the data in GroupNorm 
-        x = super().forward(x)
-        x = rearrange(tensor=x,
-                      pattern='(b t) c h w -> b c t h w', t=t)
-        
         return x 
 
 
 
-
-if __name__ == "__main__":
-
-    conv_layer = CausalConv3d(in_channels=3,
-                              out_channels=3,
-                              kernel_size=(3, 3, 3),
-                              stride=1,
-                              padding=0)
-    # print(conv_layer)
-    print(conv_layer.apply(conv_layer._init_weights))
-
-    x = torch.randn(2, 3, 8, 256, 256)
-
-    output = conv_layer(x)
-    print(output.shape) 
-
-
-        

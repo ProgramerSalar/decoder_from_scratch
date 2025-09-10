@@ -1,164 +1,163 @@
-import torch 
+# Copyright 2025 The savitri-AI Team. All rights reserved.
+#
+#    company: https://github.com/savitri-AI
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import torch
 from torch import nn 
-from einops import rearrange
 from diffusers.models.attention_processor import Attention
+from einops import rearrange
 
-from resnets.Causal_resnet import CausalResnet3d, CausalTemporalUpsample2x, CausalUpsample2x
+from resnets.Causal_resnet import (
+    CausalResnet3d,
+    CausalUpsampleHeigthWidth,
+    CausalTemporalUpsample2x
+)
 
-class CausalMidBlock3d(nn.Module):
+
+
+
+
+class CausalMiddleBlock3d(nn.Module):
 
     def __init__(self,
-                 in_channels: int,
-                 attention_head_dim: int = 512,
-                 num_groups: int = 32,
-                 add_attention: bool = True,
-                 dropout: float = 0.0,
-                 num_layers: int = 1,
-                 ):
-        
+                in_channels: int,
+                attention_head_dim: int = 512,
+                norm_num_groups: int=32,
+                dropout: bool = 0.0,
+                scale_factor: bool = 1.0,
+                eps: float = 1e-5,
+                ):
         super().__init__()
-        self.add_attention = add_attention
 
+        
         resnets = [
             CausalResnet3d(
                 in_channels=in_channels,
                 out_channels=in_channels,
-                num_groups=num_groups,
+                norm_num_groups=norm_num_groups,
                 dropout=dropout,
+                scale_factor=scale_factor,
+                eps=eps
             )
         ]
-        
-        attentions = []
-        for _ in range(num_layers):
-            if self.add_attention:
-                attentions.append(
-                    Attention(
-                    query_dim=in_channels,
-                    heads=in_channels // attention_head_dim,
-                    dim_head=attention_head_dim,
-                    rescale_output_factor=1.0,
-                    eps=1e-6,
-                    norm_num_groups=num_groups,
-                    spatial_norm_dim=None,
-                    residual_connection=True,
-                    bias=True,
-                    upcast_softmax=True,
-                    _from_deprecated_attn_block=True
-                )
-                )
-            else:
-                attentions.append(None)
 
-            resnets.append(
-                CausalResnet3d(
+        attentions = []
+        for _ in range(1):
+            attentions.append(
+                Attention(query_dim=in_channels,
+                          heads=in_channels // attention_head_dim,
+                          dim_head=attention_head_dim,
+                          rescale_output_factor=scale_factor,
+                          eps=eps,
+                          norm_num_groups=norm_num_groups,
+                          spatial_norm_dim=None,
+                          residual_connection=True,
+                          bias=True,
+                          upcast_softmax=True,
+                          _from_deprecated_attn_block=True)
+            )
+
+        resnets.append(
+            CausalResnet3d(
                 in_channels=in_channels,
                 out_channels=in_channels,
-                num_groups=num_groups,
+                norm_num_groups=norm_num_groups,
                 dropout=dropout,
+                scale_factor=scale_factor,
+                eps=eps
+
             )
-            )
+        )
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
-        
-        
 
-
-    def forward(self, 
-                hidden_size: torch.FloatTensor,
-                is_init_image=True,
-                temporal_chunk=False):
+    def forward(self,
+                x):
         
-        hidden_size = self.resnets[0](hidden_size, is_init_image, temporal_chunk)
-
-        # [batch_size, channels, time, height, width]
-        t = hidden_size.shape[2]
+        x = self.resnets[0](x)
+        b, c, t, h, w = x.shape
 
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
-            if attn is not None:
-                hidden_size = rearrange(hidden_size, 'b c t h w -> b t c h w')
-                hidden_size = rearrange(hidden_size, 'b t c h w -> (b t) c h w')
-                hidden_size = attn(hidden_size)
-                hidden_size = rearrange(hidden_size, '(b t) c h w -> b t c h w', t=t)
-                hidden_size = rearrange(hidden_size, 'b t c h w -> b c t h w')
+            x = rearrange(x, 'b c t h w -> (b t) c h w')
+            x = attn(x)
+            x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
 
-            hidden_size = resnet(hidden_size, is_init_image, temporal_chunk)
-        
-        return hidden_size
+        x = resnet(x)
 
-        
-        return hidden_size
+        return x 
     
 
-class CausalUpBlock(nn.Module):
+
+class CausalUpperBlock(nn.Module):
 
     def __init__(self,
                  in_channels: int,
                  out_channels: int,
                  num_layers: int = 3,
-                 num_groups: int = 32,
+                 norm_num_groups: int = 32,
+                 add_height_width_2x: bool = True,
+                 add_frame_2x: bool = True,
                  dropout: float = 0.0,
-                 add_spatial_upsample: bool = True,
-                 add_temporal_upsample: bool = False):
-        
-
+                 eps: float = 1e-5,
+                 scale_factor: float = 1.0):
         super().__init__()
-
+        self.add_height_width_2x = add_height_width_2x
+        self.add_frame_2x = add_frame_2x
 
         self.resnets = nn.ModuleList([])
         for i in range(num_layers):
-            input_channels = in_channels if i==0 else out_channels
+             input_channels = in_channels if i==0 else out_channels
 
-            self.resnets.append(
-                CausalResnet3d(in_channels=input_channels,
-                                    out_channels=out_channels,
-                                    num_groups=num_groups,
-                                    dropout=dropout)
-            
-            )
+             self.resnets.append(
+                 CausalResnet3d(in_channels=input_channels,
+                                out_channels=out_channels,
+                                dropout=dropout,
+                                eps=eps,
+                                scale_factor=scale_factor,
+                                norm_num_groups=norm_num_groups,
+                                )
+             )
 
-        if add_spatial_upsample:
-            self.upsamplers = nn.ModuleList([
-                CausalUpsample2x(in_channels=out_channels,
-                                 out_channels=out_channels)
+
+        if add_height_width_2x:
+            self.upsamplers_height_width = nn.ModuleList([
+                CausalUpsampleHeigthWidth(in_channels=out_channels,
+                                          out_channels=out_channels)
             ])
 
-        else:
-            self.upsamplers = None
-
-        if add_temporal_upsample:
-            self.temporal_upsamplers = nn.ModuleList([
+        if add_frame_2x:
+            self.upsamplers_frame = nn.ModuleList([
                 CausalTemporalUpsample2x(in_channels=out_channels,
                                          out_channels=out_channels)
             ])
-        else:
-            self.temporal_upsamplers = None
-
-
-
-
 
     
-    def forward(self, 
-                hidden_state: torch.FloatTensor,
-                is_init_image=True,
-                temporal_chunk=False) -> torch.FloatTensor:
+    def forward(self,
+                x):
         
         for resnet in self.resnets:
-            hidden_state = resnet(hidden_state,
-                                  is_init_image,
-                                  temporal_chunk)
-            
-        if self.upsamplers is not None:
-            for upsampler in self.upsamplers:
-                hidden_state = upsampler(hidden_state,
-                                         is_init_image,
-                                         temporal_chunk)
-                
-        if self.temporal_upsamplers is not None:
-            for temporal_upsampler in self.temporal_upsamplers:
-                hidden_state = temporal_upsampler(hidden_state,
-                                                  is_init_image,
-                                                  temporal_chunk)
-        
-        return hidden_state
-        
+            x = resnet(x)
+
+        if self.add_height_width_2x:
+            for upsampler_height_width in self.upsamplers_height_width:
+                x = upsampler_height_width(x)
+
+        if self.add_frame_2x:
+            for upsampler_frame in self.upsamplers_frame:
+                x = upsampler_frame(x)
+
+        return x 
+    
+    
+
